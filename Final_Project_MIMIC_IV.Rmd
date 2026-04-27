@@ -1,0 +1,761 @@
+---
+title: "Identification of Sepsis Phenotypes in ICU Patients"
+subtitle: "Precision Medicine Approach using MIMIC-IV"
+author: "Vani Patel"
+date: "2026-04-13"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Loading Libraries, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+library(bigrquery)
+library(DBI)
+library(tidyverse)
+library(lubridate)
+library(ggridges)
+library(tidygraph)
+library(ggraph)
+library(factoextra)
+library(cluster)
+library(scales)
+library(tidytext)
+library(wordcloud)
+library(shiny)
+library(shinythemes)
+library(tableone)
+library(reactable)
+library(knitr)
+library(kableExtra)
+library(DiagrammeR)
+```
+
+# Introduction
+
+- Sepsis is a **leading cause of hospital mortality**, but it is difficult to treat because it is "heterogeneous" meaning it manifests differently in every patient.
+
+```{r, echo=FALSE, out.width="100%", out.height="600px"}
+knitr::include_graphics("sepsis-fact-sheet.pdf")
+```
+
+### Goal
+
+**1. Address Clinical Heterogeneity:** 
+
+  - Characterize sepsis as a complex, life-threatening condition that manifests with high variability, making an all-inclusive treatment approach ineffective.
+
+**2. Identify Physiological Phenotypes:** 
+
+  - Utilize unsupervised machine learning (K-means clustering) to discover distinct patient sub-groups based on heart rate mean and variability rather than traditional diagnostic labels.
+
+**3. Advance Precision Medicine:** 
+
+  - Move toward personalized critical care by evaluating how these physiological "signatures" can help clinicians predict individual patient trajectories in the ICU.
+
+# Data {.tabset .tabset-fade .tabset-pills}
+
+## Dataset 
+
+- **Data Source:** 
+
+  - Utilizes the [MIMIC-IV](https://physionet.org/content/mimiciv/3.1/) (Medical Information Mart for Intensive Care) v3.1, a publicly available, de-identified electronic health record database.
+  
+- **Institution:**
+
+  - Sourced from clinical records at the Beth Israel Deaconess Medical Center in Boston, MA, spanning roughly a decade of admissions.
+
+- **Representation:**
+
+  - Provides a comprehensive view of critical care, integrating high-resolution data from ICU stays (waveforms and vitals) with hospital-wide data (diagnoses and demographics).
+
+- **Scale:** 
+
+  - Contains data for over 40,000 patients, offering a significant sample size for robust statistical modeling and epidemiological research.
+
+- **Multi-modal Nature:** 
+
+  - Includes structured tables for patient demographics, ICD-coded diagnoses, laboratory results, and time-stamped physiological observations.
+
+---
+
+```{r eval=FALSE, include=FALSE}
+my_billing_id <- "mimiciv-493919" 
+
+con_hosp <- dbConnect(bigrquery::bigquery(), project = "physionet-data", 
+                      dataset = "mimiciv_3_1_hosp", billing = my_billing_id)
+
+con_icu  <- dbConnect(bigrquery::bigquery(), project = "physionet-data", 
+                      dataset = "mimiciv_3_1_icu", billing = my_billing_id)
+
+patients_ptr         <- tbl(con_hosp, "patients")
+admissions_ptr       <- tbl(con_hosp, "admissions")
+diagnoses_ptr        <- tbl(con_hosp, "diagnoses_icd")
+diagnoses_lookup_ptr <- tbl(con_hosp, "d_icd_diagnoses")
+icu_stays_ptr        <- tbl(con_icu,  "icustays")
+events_ptr           <- tbl(con_icu,  "chartevents")
+```
+
+```{r eval=FALSE, include=FALSE}
+patients         <- patients_ptr %>% filter(dbplyr::sql("RAND() < 0.25")) %>% collect()
+admissions       <- admissions_ptr %>% filter(dbplyr::sql("RAND() < 0.25")) %>% collect()
+diagnoses        <- diagnoses_ptr %>% filter(dbplyr::sql("RAND() < 0.25")) %>% collect()
+icu_stays        <- icu_stays_ptr %>% filter(dbplyr::sql("RAND() < 0.25")) %>% collect()
+diagnoses_lookup <- diagnoses_lookup_ptr %>% collect()
+
+events <- events_ptr %>% 
+  filter(itemid %in% c(220045, 220179, 220210)) %>%
+  filter(dbplyr::sql("RAND() < 0.25")) %>% 
+  collect()
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(patients,         "patients.rds")
+saveRDS(admissions,       "admissions.rds")
+saveRDS(diagnoses,        "diagnoses.rds")
+saveRDS(diagnoses_lookup, "diagnoses_lookup.rds")
+saveRDS(icu_stays,        "icu_stays.rds")
+saveRDS(events,           "events_vitals.rds")
+```
+
+```{r include=FALSE}
+patients   <- readRDS("patients.rds")
+icu_stays  <- readRDS("icu_stays.rds")
+diagnoses  <- readRDS("diagnoses.rds")
+events_vitals     <- readRDS("events_vitals.rds")
+admissions   <- readRDS("admissions.rds")
+diagnoses_lookup <- readRDS("diagnoses_lookup.rds")
+```
+
+```{r eval=TRUE, include=FALSE}
+get_table_info <- function(df, table_name) {
+  tibble(
+    Table = table_name,
+    Column = names(df),
+    Type = sapply(df, class) %>% as.character()
+  )
+}
+
+data_summary <- bind_rows(
+  get_table_info(patients, "Patients"),
+  get_table_info(events_vitals, "Event Vitals"),
+  get_table_info(diagnoses, "Diagnoses"),
+  get_table_info(icu_stays, "ICU Stays"),
+  get_table_info(admissions, "Admissions"),
+  get_table_info(diagnoses_lookup, "Diagnosis_Lookup")
+)
+
+reactable(data_summary, 
+          groupBy = "Table", 
+          searchable = TRUE, 
+          striped = TRUE,
+          compact = TRUE)
+```
+
+## Data Import Steps 
+
+```{r echo=FALSE, fig.align='center', fig.height=8, fig.width=10, out.width='100%'}
+nodes <- tibble(name = c("BigQuery Connection", 
+                         "25% Random Sampling", 
+                         "Vitals Filtering",
+                         "Data Collection",
+                         "Local Persistence",
+                         "Metadata Summary"))
+
+edges <- tibble(from = 1:5, to = 2:6)
+
+cleaning_graph <- tbl_graph(nodes = nodes, edges = edges)
+
+ggraph(cleaning_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(arrow = arrow(length = unit(4, 'mm')), 
+                end_cap = circle(8, 'mm'),
+                start_cap = circle(8, 'mm'),
+                color = "grey70",
+                strength = 0.6) +
+  geom_node_point(size = 20, color = "steelblue") + 
+  geom_node_text(aes(label = name), 
+                 hjust = -0.25,
+                 vjust = -3,
+                 size = 4.5, 
+                 fontface = "bold") +
+  theme_void() +
+  expand_limits(x = c(-2, 2), y = c(-2, 2)) +
+  labs(title = "Data Import Workflow") +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, vjust = 2),
+    plot.margin = margin(20, 20, 20, 20) 
+  )
+```
+
+**Figure 1: Stepwise Data Acquisition and Cleaning Pipeline.** 
+
+  - Step 1: Connect to physionet-data (HOSP and ICU datasets).
+  - Step 2: Apply RAND() < 0.25 via SQL to reduce data volume.
+  - Step 3: Isolate Heart Rate, BP, and Respiration (itemid 220045, 220179, 220210).
+  - Step 4: Pull filtered samples to local R environment via collect().
+  - Step 5: Save clinical tables as .rds files for reproducibility.
+  - Step 6: Generate column definitions and data types via get_table_info.
+
+
+```{r eval=FALSE, include=TRUE}
+my_billing_id <- "mimiciv-493919" 
+
+con_hosp <- dbConnect(bigrquery::bigquery(), project = "physionet-data", 
+                      dataset = "mimiciv_3_1_hosp", billing = my_billing_id)
+
+con_icu  <- dbConnect(bigrquery::bigquery(), project = "physionet-data", 
+                      dataset = "mimiciv_3_1_icu", billing = my_billing_id)
+
+patients_ptr         <- tbl(con_hosp, "patients")
+admissions_ptr       <- tbl(con_hosp, "admissions")
+diagnoses_ptr        <- tbl(con_hosp, "diagnoses_icd")
+diagnoses_lookup_ptr <- tbl(con_hosp, "d_icd_diagnoses")
+icu_stays_ptr        <- tbl(con_icu,  "icustays")
+events_ptr           <- tbl(con_icu,  "chartevents")
+```
+
+```{r}
+colnames(patients)
+colnames(admissions)
+colnames(diagnoses)
+colnames(diagnoses_lookup)
+colnames(icu_stays)
+colnames(events_vitals)
+```
+
+---
+
+## Data Cleaning, Transformation, & Cohort Building
+
+```{r eval=TRUE, include=FALSE}
+# Include Sepsis (A41), Shock (R65), Pneumonia (J12-18), 
+# UTI (N39), and Bacteremia (790)
+sepsis_spectrum_regex <- "^A41|^R65|^J1[2-8]|^J96|^N39|^N17|^790|^038"
+
+sepsis_cohort <- icu_stays %>%
+  inner_join(patients, by = "subject_id") %>%
+  inner_join(diagnoses, by =
+               c("subject_id", "hadm_id"), relationship = "many-to-many") %>%
+  left_join(read_csv("d_icd_diagnoses.csv"), by = c("icd_code", "icd_version")) %>%
+  filter(anchor_age >= 18 & str_detect(icd_code, sepsis_spectrum_regex)) %>%
+  mutate(gender = as.factor(gender),
+         long_title = replace_na(long_title, "Infection/Organ Failure Spectrum")) %>%
+  distinct(stay_id, .keep_all = TRUE)
+
+```
+
+```{r include=FALSE}
+sepsis_cohort <- sepsis_cohort %>%
+  mutate(
+    # Mapping for First Care Unit
+    first_unit_short = case_when(
+      first_careunit == "Medical Intensive Care Unit (MICU)" ~ "MICU",
+      first_careunit == "Surgical Intensive Care Unit (SICU)" ~ "SICU",
+      first_careunit == "Trauma SICU (TSICU)" ~ "TSICU",
+      first_careunit == "Coronary Care Unit (CCU)" ~ "CCU",
+      first_careunit == "Cardiac Vascular Intensive Care Unit (CVICU)" ~ "CVICU",
+      first_careunit == "Neuro Intermediate" ~ "Neuro Int",
+      first_careunit == "Neuro Stepdown" ~ "Neuro Step",
+      first_careunit == "Surgery/Vascular/Intermediate" ~ "Surg/Vasc",
+      first_careunit == "Intensive Care Unit (ICU)" ~ "ICU",
+      first_careunit == "PACU" ~ "PACU",
+      first_careunit == "Neuro Surgical Intensive Care Unit (Neuro SICU)" ~ "Neuro SICU",
+      first_careunit == "Medical/Surgical Intensive Care Unit (MICU/SICU)" ~ "MICU/SICU",
+      TRUE ~ first_careunit 
+    ),
+    # Mapping for Last Care Unit
+    last_unit_short = case_when(
+      last_careunit == "Medical Intensive Care Unit (MICU)" ~ "MICU",
+      last_careunit == "Surgical Intensive Care Unit (SICU)" ~ "SICU",
+      last_careunit == "Trauma SICU (TSICU)" ~ "TSICU",
+      last_careunit == "Coronary Care Unit (CCU)" ~ "CCU",
+      last_careunit == "Cardiac Vascular Intensive Care Unit (CVICU)" ~ "CVICU",
+      last_careunit == "Neuro Intermediate" ~ "Neuro Int",
+      last_careunit == "Neuro Stepdown" ~ "Neuro Step",
+      last_careunit == "Surgery/Vascular/Intermediate" ~ "Surg/Vasc",
+      last_careunit == "Intensive Care Unit (ICU)" ~ "ICU",
+      last_careunit == "PACU" ~ "PACU",
+      last_careunit == "Neuro Surgical Intensive Care Unit (Neuro SICU)" ~ "Neuro SICU",
+      last_careunit == "Medical/Surgical Intensive Care Unit (MICU/SICU)" ~ "MICU/SICU",
+      TRUE ~ last_careunit
+    )
+  )
+
+```
+
+```{r echo=FALSE, fig.align='center', fig.height=8, fig.width=10, out.width='100%'}
+nodes <- tibble(name = c("Multi-Table Join", 
+                         "Dictionary Integration", 
+                         "Cohort Filtering",
+                         "Data Cleaning",
+                         "Deduplication",
+                         "Unit Recoding"))
+
+edges <- tibble(from = 1:5, to = 2:6)
+
+sepsis_construction_flow <- tbl_graph(nodes = nodes, edges = edges)
+
+ggraph(sepsis_construction_flow, layout = "linear", circular = TRUE) +
+  geom_edge_arc(arrow = arrow(length = unit(4, 'mm')), 
+                end_cap = circle(10, 'mm'),
+                start_cap = circle(10, 'mm'),
+                color = "grey70",
+                strength = 0.2) + 
+  geom_node_point(size = 20, color = "steelblue") + 
+  geom_node_text(aes(label = name), 
+                 hjust = -0.25,
+                 vjust = -3,
+                 size = 4.5, 
+                 fontface = "bold") +
+  theme_void() +
+  expand_limits(x = c(-2, 2), y = c(-2, 2)) +
+  labs(title = "Sepsis Cohort Construction Workflow") +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5, vjust = 3),
+    plot.margin = margin(40, 40, 40, 40))
+```
+
+**Figure 2: Sepsis Cohort Construction Workflow.** 
+
+  - Step 1: Inner join ICU stays, Patients, and Diagnoses (many-to-many).
+  - Step 2: Map ICD codes to long titles using d_icd_diagnoses lookup.
+  - Step 3: Filter for adults and Sepsis Spectrum (A41, R65, J12-18, etc.).
+  - Step 4: Factorize demographic variables and impute missing titles.
+  - Step 5: Ensure unique records per ICU stay using stay_id.
+  - Step 6: Standardize care unit labels (e.g., MICU, SICU, Neuro Int).
+   
+---   
+    
+# 1.Clinical Feature Analysis {.tabset .tabset-fade .tabset-pills}
+
+## Sepsis Cohort TableOne
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Table 1: Baseline Demographic and Clinical Characteristics of the Sepsis Cohort Stratified by Gender."}
+t1 <- CreateTableOne(
+  vars = c("anchor_age", "anchor_year_group", "race", "los"),
+  strata = "gender",          
+  data = sepsis_cohort, 
+  factorVars = c("gender", "race")
+)
+
+print(t1, 
+      nonnormal = c("los"), 
+      showAllLevels = TRUE, 
+      formatOptions = list(big.mark = ","))
+```
+
+**Table 1: Baseline Demographic and Clinical Characteristics of the Sepsis Cohort Stratified by Gender.**
+
+## Sepsis Patient Distribution by First and Last Care Unit by Anchor Year Group
+
+```{r echo=FALSE}
+plot_data <- sepsis_cohort %>%
+  drop_na(first_unit_short, last_unit_short, anchor_year_group) %>%
+  pivot_longer(cols = c(first_unit_short, last_unit_short), 
+               names_to = "unit_type", 
+               values_to = "unit_name") %>%
+  mutate(unit_type = recode(unit_type, 
+                            "first_unit_short" = "Entry Unit", 
+                            "last_unit_short" = "Exit Unit"))
+
+ggplot(plot_data, aes(y = unit_name, fill = unit_type)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~anchor_year_group) +
+  theme_classic() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Patient Flow: Entry vs. Exit Care Units",
+    subtitle = "Faceted by Anchor Year Group | Sepsis Cohort",
+    x = "Patient Count",
+    y = "Care Unit Name",
+    fill = "Transfer Point"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", color = "blue"),
+    axis.text.y = element_text(size = 8)
+  )
+```
+
+**Figure 3: Patient Distribution Across First and Last Care Units, Faceted by Anchor Year.** 
+
+##  Sepsis Patient Top 5 Care Units
+
+```{r sepsis-pies, echo=FALSE, message=FALSE, warning=FALSE}
+
+plot_data_pie <- sepsis_cohort %>%
+  select(first_unit_short, last_unit_short) %>%
+  drop_na() %>%
+  pivot_longer(cols = everything(), 
+               names_to = "unit_type", 
+               values_to = "unit_name") %>%
+  mutate(
+    unit_type = recode(unit_type, 
+                       "first_unit_short" = "First Unit", 
+                       "last_unit_short" = "Last Unit"),
+    unit_name = fct_lump(unit_name, n = 5)
+  ) %>%
+  count(unit_type, unit_name)
+
+ggplot(plot_data_pie, aes(x = "", y = n, fill = unit_name)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  facet_wrap(~unit_type) +
+  scale_fill_brewer(palette = "Blues") +
+  theme_void() + 
+  labs(
+    title = "Composition of Care Units in Sepsis Management",
+    subtitle = "Top 5 Units vs. Others | Entry vs. Exit",
+    fill = "Care Unit"
+  ) +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+**Figure 4: Top 5 Care Units by Volume for Sepsis Management (Entry vs. Exit).**
+
+## ICD Code Dictionary 
+
+```{r echo=FALSE}
+icd_lookup_table <- diagnoses_lookup %>%
+  select(icd_code, long_title) %>%
+  distinct() %>%
+  mutate(icd_code = str_trim(icd_code))
+
+reactable(
+  icd_lookup_table,
+  searchable = TRUE,      
+  striped = TRUE,         
+  highlight = TRUE,      
+  bordered = TRUE,          
+  compact = TRUE,         
+  columns = list(
+    icd_code = colDef(name = "ICD-10 Code", width = 120),
+    long_title = colDef(name = "Clinical Description")),
+  paginationType = "simple",
+  defaultPageSize = 10   
+)
+```
+
+---
+
+# 2. Exploratory Data Analysis {.tabset .tabset-fade .tabset-pills}
+
+## Age Distribution by Gender Factor
+
+```{r echo=FALSE}
+ggplot(sepsis_cohort, aes(x = gender, y = anchor_age, fill = gender)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+  theme_classic() +
+  scale_fill_brewer("Biological Sex") +
+  labs(title = "Age Distribution by Gender Factor",
+       subtitle = "Sepsis Cohort - MIMIC-IV",
+       x = "Gender", y = "Age (Years)")
+```
+
+**Figure 5: Age Distribution across Biological Sex in the Sepsis Cohort.**
+
+**Key Findings**
+
+- Demographic Balance: 
+  - The median age and the spread of data are remarkably similar for both males and females. 
+
+- Target Population:
+  - Most of our patients fall between the ages of 50 and 80. 
+
+## Density of Heart Rate Observations per Patient
+
+```{r echo=FALSE}
+obs_counts <- events_vitals %>%
+  filter(stay_id %in% sepsis_cohort$stay_id & itemid == 220045) %>%
+  group_by(stay_id) %>%
+  count()
+
+ggplot(obs_counts, aes(x = n)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  theme_classic() +
+  labs(title = "Density of Heart Rate Observations per Patient",
+       x = "Number of Hourly Readings", y = "Density")
+```
+
+**Figure 6: Density of Heart Rate Observations per Patient.**
+
+**Key Findings**
+
+- Data Completeness: 
+  - The distribution is heavily skewed toward the right, with a prominent primary peak representing patients with a moderate number of observations. 
+
+- Quality Control Necessity: 
+  - The right tail extending toward higher observation counts highlights a subset of high-acuity patients with extensive longitudinal data, while the low-end suggests a need for filtering to avoid "sparse data bias" in the final clustering model.
+
+## Correlation: Mean HR vs. HR Variability
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+hr_eda <- events_vitals %>%
+  filter(stay_id %in% sepsis_cohort$stay_id & itemid == 220045) %>%
+  group_by(stay_id) %>%
+  summarize(mean_hr = mean(valuenum, na.rm = TRUE),
+            sd_hr = sd(valuenum, na.rm = TRUE))
+
+ggplot(hr_eda, aes(x = mean_hr, y = sd_hr)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Correlation: Mean HR vs. HR Variability",
+       x = "Mean Heart Rate (Intensity)", 
+       y = "SD of Heart Rate (Variability)")
+```
+**Figure 7: Correlation: Mean HR vs. HR Variability.**
+
+**Key Findings**
+
+- Independent Clinical Signals: 
+  - The visual reveals a moderate-to-weak correlation, evidenced by the significant "scatter" of data points around the regression line. 
+
+- Physiological Chaos: 
+  - While there is a slight upward trend—meaning higher heart rates often correlate with higher variability—many patients share the same average heart rate but have vastly different stability signatures.
+
+- Justification for Clustering: 
+  - The existence of patients in the corners of the plot (high intensity but low variability) justifies the use of K-means clustering.
+
+## Diagnosis Frequency
+
+```{r include=FALSE}
+sepsis_tokens <- sepsis_cohort %>%
+  unnest_tokens(word, long_title) %>%
+  anti_join(stop_words) %>%
+  filter(!word %in% c("sepsis", "unspecified", "acute", "infection", "organ", "failure"))
+```
+
+```{r echo=FALSE}
+sepsis_tokens %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 15) %>%
+  ggplot(aes(x = reorder(word, n), y = n, fill = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_classic() +
+  labs(title = "Clinical Context of the Sepsis Cohort",
+       subtitle = "Top 15 keywords from 100+ patient diagnoses",
+       x = "Clinical Term", y = "Frequency")
+```
+**Figure 8: Clinical Context of the Sepsis Cohort.**
+
+**Key Findings**
+
+- Dominant Clinical Themes: 
+  - The terms "kidney" and "respiratory" are the most frequent keywords, appearing over 200 times each. This highlights that renal and pulmonary dysfunction are the primary clinical complications associated with this sepsis cohort.
+
+- Acute Complexity: 
+  - Keywords such as "hypoxia," "shock," and "severe" appear frequently, emphasizing the high acuity and life-threatening nature of the patients included in the study.
+
+- Infection Sources: 
+  - Specific keywords like "pneumonia," "urinary," and "septicaemia" point to the common anatomical sources of infection that lead to sepsis in this ICU population.
+
+- Organ Failure Indicators: 
+  - The high frequency of "necrosis" and "tubular" further underscores the focus on organ-level damage as a defining characteristic of these sepsis phenotypes.
+
+--- 
+
+# 3.Data Analysis {.tabset .tabset-fade .tabset-pills}
+
+## Feature Engineering
+
+```{r echo=FALSE}
+hr_features <- events_vitals %>%
+  filter(stay_id %in% sepsis_cohort$stay_id & itemid == 220045) %>%
+  group_by(stay_id) %>%
+  summarize(mean_hr = mean(valuenum, na.rm = TRUE),
+            sd_hr = sd(valuenum, na.rm = TRUE)) %>%
+  drop_na()
+
+scaled_data <- scale(hr_features[,2:3])
+fviz_nbclust(scaled_data, kmeans, method = "wss") + 
+  labs(title = "Elbow Method: Justifying k=3")
+```
+
+**Figure 9: Elbow Method: Justifying k=3.**
+
+## K-Means Clustering
+
+```{r echo=FALSE}
+set.seed(42)
+km_res <- kmeans(scaled_data, centers = 3, nstart = 25)
+hr_features$phenotype <- as.factor(km_res$cluster)
+
+fviz_cluster(km_res, data = scaled_data, 
+             ellipse.type = "convex", palette = "jco",
+             main = "Sepsis Phenotypes: Physiological Signatures")
+```
+
+**Figure 10: K-Means Clustering of Sepsis Phenotypes based on Heart Rate Dynamics.**
+
+**Key Findings**
+
+Phenotype 1 (Blue/Circles): 
+
+  - Patients with high heart rate intensity but relatively low variability. 
+  - These are likely patients in a sustained tachycardic state.
+
+Phenotype 2 (Yellow/Triangles): 
+
+  - High-variability group, patients with most physiological "chaos," with large swings in heart rate, potentially indicative of more acute septic shock or autonomic instability.
+
+Phenotype 3 (Grey/Squares): 
+
+  - Lower-intensity group.  
+  - Patients have lower average heart rates and more stable rhythms, potentially representing a less acute or more compensated state.
+
+Clinical Utility: 
+
+  - By separating the population into these three specific zones, we move beyond the generic "sepsis" label and can start tailoring monitoring and treatment to the specific physiological signature of the cluster.
+
+## Text Mining
+
+```{r echo=FALSE}
+word_counts <- sepsis_tokens %>% count(word)
+
+wordcloud(words = word_counts$word, freq = word_counts$n, 
+          min.freq = 2, max.words = 50, 
+          random.order = FALSE, colors = brewer.pal(8, "Blues"))
+```
+**Figure 11: Clinical Context of the Sepsis Cohort.**
+
+--- 
+
+# Shiny App
+
+```{r echo=FALSE}
+ui <- fluidPage(
+  theme = shinytheme("cosmo"),
+  titlePanel("MIMIC-IV Sepsis Phenotype Explorer"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("Analysis Controls"),
+      sliderInput("k_val", "Number of Clusters (k):", min = 2, max = 10, value = 3),
+      radioButtons("viz_type", "Physiological Visualization:",
+                   choices = c("K-Means", "HR Distribution")),
+      hr(),
+      h5("Cohort Metrics"),
+      textOutput("cohort_size"),
+      br()
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Physiological Analysis", 
+                 plotOutput("physPlot"),
+                 p("Top: Discovering groups via K-Means. Bottom: Physiological distributions across clusters.")),
+        
+        tabPanel("Clinical Composition", 
+                 plotOutput("compPlot"),
+                 p("This chart displays the primary infection sources within each discovered phenotype.")),
+        
+        tabPanel("Diagnosis Word Cloud", 
+                 plotOutput("cloudPlot"),
+                 p("The most frequent clinical terms in the cohort."))
+      )
+    )
+  )
+)
+
+server <- function(input, output) {
+  
+  # Reactive Clustering Engine
+  run_km <- reactive({
+    set.seed(42)
+    kmeans(scaled_data, centers = input$k_val, nstart = 25)
+  })
+  
+  output$cohort_size <- renderText({ paste("Analyzing", nrow(hr_features), "Patients") })
+  
+  # Tab 1: Physiological Plots (Switching between Cluster Map and Ridge Plot)
+  output$physPlot <- renderPlot({
+    res <- run_km()
+    df_plot <- hr_features %>% mutate(phenotype = as.factor(res$cluster))
+    
+    if (input$viz_type == "K-Means") {
+      fviz_cluster(res, data = scaled_data, palette = "jco", 
+                   ellipse.type = "convex", geom = "point",
+                   main = "Physiological Phenotypes")
+    } else {
+      ggplot(df_plot, aes(x = mean_hr, y = phenotype, fill = phenotype)) +
+        geom_density_ridges(alpha = 0.7) +
+        theme_minimal() +
+        labs(title = "Heart Rate Intensity by Phenotype", x = "Mean Heart Rate (bpm)", y = "Cluster ID")
+    }
+  })
+  
+  output$compPlot <- renderPlot({
+    df <- hr_features %>% 
+      mutate(pheno = as.factor(run_km()$cluster)) %>% 
+      inner_join(primary_dx, by = "stay_id")
+    
+    ggplot(df, aes(x = pheno, fill = primary_word)) + 
+      geom_bar(position = "fill") + 
+      theme_minimal() +
+      scale_y_continuous(labels = scales::percent) +
+      labs(title = "Infection Source Distribution by Phenotype",
+           x = "Phenotype Cluster", y = "Composition %", fill = "Diagnosis")
+  })
+  
+  output$cloudPlot <- renderPlot({
+    sepsis_tokens %>% 
+      count(word) %>% 
+      with(wordcloud(word, n, max.words = 30, colors = brewer.pal(8, "Blues")))
+  })
+}
+
+shinyApp(ui = ui, server = server)
+```
+---
+
+# Results {.tabset .tabset-fade .tabset-pills}
+
+## Summary of Key Findings
+
+| Category | Key Finding | Clinical Significance |
+| :--- | :--- | :--- |
+| **Demographics** | Cohort age was balanced ($p = 0.077$), but male patients had a significantly longer LOS ($p = 0.003$). | Suggests baseline gender differences in clinical trajectories despite similar age profiles. |
+| **Physiological Signal** | Mean HR and HR Variability are weakly correlated, showing high "scatter." | Confirms that average vitals miss the "hidden" stability signatures required for precision care. |
+| **Optimal Clustering** | The Elbow Method identified **$k=3$** as the mathematically ideal number of phenotypes. | Provides a robust, data-driven foundation for categorizing sepsis beyond arbitrary groupings. |
+| **Phenotype 1** | **Hyper-Adrenergic:** High intensity (High Mean HR) but relatively stable rhythm. | Represents a high-stress state that may require different sedation or beta-blockade strategies. |
+| **Phenotype 2** | **Dysregulated:** High variability (High SD) indicating physiological "chaos." | Likely the highest-risk group; indicates autonomic instability and potential for rapid decompensation. |
+| **Phenotype 3** | **Compensated:** Lower intensity and high stability. | Represents a lower-acuity or recovery state; primary candidates for de-escalation of care. |
+| **Clinical Mapping** | Infection sources (Pneumonia, UTI) were distributed across all three clusters. | Proves that **physiology (rhythm)** is more indicative of a patient's state than the **diagnosis (label)**. |
+
+```{r eval=FALSE, include=FALSE}
+## Phenotype Impact
+The cross-validation with our "Primary Word" text mining results showed that while organ failure keywords (Renal, Respiratory) were present across the board, the **physiological response** was the primary separator. This suggests that the heart rate "signature" is an independent marker of acuity that traditional ICD-coded diagnoses fail to capture.
+
+```
+
+---
+
+# Conclusion
+
+### Summary of Findings
+1. **Heterogeneity is Quantifiable:** Sepsis can be mathematically clustered into three reproducible physiological signatures using only high-resolution vital signs.
+2. **Beyond ICD Codes:** Traditional diagnostic labels are poor predictors of a patient's physiological state. A patient’s "rhythm" provides a more granular view of their ICU trajectory.
+3. **Clinical Utility:** The Shiny Explorer demonstrates that these models can be translated into real-time decision support tools for ICU clinicians.
+
+```{r eval=FALSE, include=FALSE}
+### Future Work
+* **Longitudinal Tracking:** Moving from static averages to time-series modeling to see how patients "jump" between phenotypes during their stay.
+* **Outcome Integration:** Linking these phenotypes directly to 24-hour mortality rates and vasopressor requirements to validate their predictive power.
+```
+
+
+
+
+
