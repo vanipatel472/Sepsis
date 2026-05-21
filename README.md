@@ -64,3 +64,12 @@ if(length(new_pkgs)) install.packages(new_pkgs)
 
 # Run the app directly from this repository
 shiny::runGitHub(repo = "YOUR-REPOSITORY-NAME", username = "YOUR-GITHUB-USERNAME")
+
+---
+
+## 👩‍💻 About the Author
+
+**Vani Patel** is a Master’s student in **Biostatistics**, specializing in the intersection of data science, machine learning applications, and medical technology solutions. 
+
+With an academic foundation combining **Bioinformatics and Economics** from the University of Waterloo alongside prior professional experience in **tech consulting**, her work focuses on leveraging large-scale health informatics, EHR analytics, and consumer wearable streams to remove processing latency from patient monitoring pipelines. 
+
