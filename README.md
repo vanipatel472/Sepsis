@@ -3,8 +3,8 @@
 
 [![R-Project](https://img.shields.io/badge/R-276DC3?style=flat&logo=r&logoColor=white)](https://www.r-project.org/)
 [![Shiny](https://img.shields.io/badge/Shiny-17a2b8?style=flat&logo=rstudio&logoColor=white)](https://shiny.posit.co/)
-[![Database-MIMIC_IV](https://img.shields.io/badge/Shiny-17a2b8?style=flat&logo=rstudio&logoColor=white)](https://physionet.org/content/mimiciv/3.1/)
-[![Domain-Healthcare_Analytics](https://img.shields.io/badge/Shiny-17a2b8?style=flat&logo=rstudio&logoColor=white)](https://physionet.org/content/mimiciv/3.1/)
+[![Database-MIMIC_IV](https://img.shields.io/badge/Database-MIMIC-IV-17a2b8?style=flat&logo=rstudio&logoColor=white)](https://physionet.org/content/mimiciv/3.1/)
+[![Domain-Healthcare_Analytics](https://img.shields.io/badge/Domain-Healthcare Analytics-17a2b8?style=flat&logo=rstudio&logoColor=white)](https://physionet.org/content/mimiciv/3.1/)
 
 ## Project Overview
 Sepsis remains a leading cause of intensive care unit (ICU) mortality worldwide. A primary challenge in clinical treatment is its extreme **heterogeneity**—the condition manifests uniquely across patient populations, meaning uniform treatment protocols often fail. 
