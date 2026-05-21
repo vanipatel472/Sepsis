@@ -64,6 +64,7 @@ if(length(new_pkgs)) install.packages(new_pkgs)
 
 # Run the app directly from this repository
 shiny::runGitHub(repo = "YOUR-REPOSITORY-NAME", username = "YOUR-GITHUB-USERNAME")
+```
 
 ---
 
